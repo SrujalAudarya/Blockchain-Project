@@ -84,7 +84,7 @@ If you want persistent cloud storage and real-time multi-user synchronization:
 │   └── land-map.tsx      # Interactive Leaflet map component
 ├── contracts/            # Smart contracts and ABI definitions
 ├── lib/                  # Application state and utilities
-│   ├── land-store.ts     # Hybrid Supabase + LocalStorage store
+│   ├── land-store.ts     # Supabase real-time store
 │   ├── wallet-context.ts # Web3 and demo wallet provider
 │   └── supabase.ts       # Supabase client initializer
 ├── supabase/             # Database migrations

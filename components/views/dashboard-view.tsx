@@ -2,7 +2,7 @@
 
 import { useState, useMemo } from "react";
 import dynamic from "next/dynamic";
-import { Search, X, FileText, TrendingUp, CheckCircle2, Building2, ArrowRightLeft, Database } from "lucide-react";
+import { Search, X, FileText, TrendingUp, CheckCircle2, Building2, ArrowRightLeft } from "lucide-react";
 import { toast } from "sonner";
 import { useLandStore } from "@/lib/land-store";
 import { useWallet } from "@/lib/wallet-context";
@@ -20,7 +20,7 @@ import type { Land, TransferRecord } from "@/lib/types";
 const LandMap = dynamic(() => import("@/components/land-map").then((m) => m.LandMap), { ssr: false });
 
 export function DashboardView() {
-  const { lands, history, loaded, error, isUsingFallback, refresh, getHistory } = useLandStore();
+  const { lands, history, loaded, error, refresh, getHistory } = useLandStore();
   const { address } = useWallet();
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<Land | null>(null);
@@ -79,20 +79,6 @@ export function DashboardView() {
         title="Land Registry Dashboard"
         subtitle="Overview of registered land records and ownership activity."
       />
-
-      {isUsingFallback && (
-        <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-4 text-sm text-emerald-200">
-          <Database className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
-          <div className="space-y-1">
-            <p className="font-medium text-emerald-300">
-              Offline / Demo Storage Active
-            </p>
-            <p className="text-xs text-emerald-300/80 leading-relaxed">
-              Remote Supabase database is unreachable or unconfigured. Running in local browser storage mode — all features (parcels, lookup, registration, transfers, interactive map) are completely functional and will persist in your browser!
-            </p>
-          </div>
-        </div>
-      )}
 
       {/* Stats */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">

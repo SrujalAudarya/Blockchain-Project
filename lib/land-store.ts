@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { supabase, isSupabaseConfigured } from "./supabase";
+import { useState, useEffect, useCallback } from "react";
+import { supabase } from "./supabase";
 import type { Land, TransferRecord } from "./types";
 
 type LandRow = {
@@ -29,10 +29,7 @@ type TransferRow = {
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
-const STORAGE_KEY_LANDS = "land_registry_lands_v1";
-const STORAGE_KEY_HISTORY = "land_registry_history_v1";
-
-const seedLandsRaw: Omit<Land, "id">[] = [
+const seedLands: Omit<Land, "id">[] = [
   {
     location: "Sector 12, Gurugram, Haryana",
     areaSquareMeters: 250,
@@ -71,63 +68,6 @@ const seedLandsRaw: Omit<Land, "id">[] = [
   },
 ];
 
-function getInitialLocalData(): { lands: Land[]; history: Record<number, TransferRecord[]> } {
-  const lands: Land[] = seedLandsRaw.map((item, index) => ({
-    ...item,
-    id: index + 1,
-  }));
-
-  const history: Record<number, TransferRecord[]> = {};
-  for (const land of lands) {
-    history[land.id] = [
-      {
-        landId: land.id,
-        from: ZERO_ADDRESS,
-        to: land.currentOwner,
-        timestamp: land.registeredAt,
-        note: "Initial registration by Govt. Registrar",
-      },
-    ];
-  }
-
-  return { lands, history };
-}
-
-function loadLocalRegistry(): { lands: Land[]; history: Record<number, TransferRecord[]> } {
-  if (typeof window === "undefined") {
-    return getInitialLocalData();
-  }
-
-  try {
-    const rawLands = localStorage.getItem(STORAGE_KEY_LANDS);
-    const rawHistory = localStorage.getItem(STORAGE_KEY_HISTORY);
-
-    if (rawLands && rawHistory) {
-      const parsedLands: Land[] = JSON.parse(rawLands);
-      const parsedHistory: Record<number, TransferRecord[]> = JSON.parse(rawHistory);
-      if (Array.isArray(parsedLands) && parsedLands.length > 0) {
-        return { lands: parsedLands, history: parsedHistory };
-      }
-    }
-  } catch {
-    // If parsing fails, reinitialize
-  }
-
-  const initial = getInitialLocalData();
-  saveLocalRegistry(initial.lands, initial.history);
-  return initial;
-}
-
-function saveLocalRegistry(lands: Land[], history: Record<number, TransferRecord[]>) {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY_LANDS, JSON.stringify(lands));
-    localStorage.setItem(STORAGE_KEY_HISTORY, JSON.stringify(history));
-  } catch {
-    // Storage quota or private browsing exceptions
-  }
-}
-
 function toLand(row: LandRow): Land {
   return {
     id: row.id,
@@ -154,13 +94,11 @@ function toTransfer(row: TransferRow): TransferRecord {
   };
 }
 
-async function seedRemoteRegistry(): Promise<{ lands: Land[]; history: Record<number, TransferRecord[]> }> {
-  if (!supabase) throw new Error("Supabase is not configured");
-
+async function seedRegistry(): Promise<{ lands: Land[]; history: Record<number, TransferRecord[]> }> {
   const { data: inserted, error: insertError } = await supabase
     .from("land_registry_lands")
     .insert(
-      seedLandsRaw.map((land) => ({
+      seedLands.map((land) => ({
         location: land.location,
         area_square_meters: land.areaSquareMeters,
         survey_number: land.surveyNumber,
@@ -206,49 +144,53 @@ async function seedRemoteRegistry(): Promise<{ lands: Land[]; history: Record<nu
   };
 }
 
-type RegistryData = { lands: Land[]; history: Record<number, TransferRecord[]>; isUsingFallback: boolean };
+type RegistryData = { lands: Land[]; history: Record<number, TransferRecord[]> };
+
+let registryLoadInFlight: Promise<RegistryData> | null = null;
 
 async function loadRegistryData(): Promise<RegistryData> {
-  if (!isSupabaseConfigured || !supabase) {
-    const local = loadLocalRegistry();
-    return { ...local, isUsingFallback: true };
+  const [{ data: landRows, error: landError }, { data: transferRows, error: transferError }] = await Promise.all([
+    supabase.from("land_registry_lands").select("*").order("id", { ascending: true }),
+    supabase.from("land_registry_transfers").select("*").order("transferred_at", { ascending: true }),
+  ]);
+
+  if (landError) throw landError;
+  if (transferError) throw transferError;
+
+  if (!landRows || landRows.length === 0) {
+    return seedRegistry();
   }
 
-  try {
-    // 3.5s timeout so the app never hangs if the Supabase project is paused or slow
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error("Supabase query timed out")), 3500)
-    );
-
-    const queryPromise = Promise.all([
-      supabase.from("land_registry_lands").select("*").order("id", { ascending: true }),
-      supabase.from("land_registry_transfers").select("*").order("transferred_at", { ascending: true }),
-    ]);
-
-    const [landsRes, transfersRes] = await Promise.race([queryPromise, timeoutPromise]);
-
-    if (landsRes.error) throw landsRes.error;
-    if (transfersRes.error) throw transfersRes.error;
-
-    if (!landsRes.data || landsRes.data.length === 0) {
-      const seeded = await seedRemoteRegistry();
-      saveLocalRegistry(seeded.lands, seeded.history);
-      return { ...seeded, isUsingFallback: false };
-    }
-
-    const lands = (landsRes.data as LandRow[]).map(toLand);
-    const history = (transfersRes.data as TransferRow[]).reduce<Record<number, TransferRecord[]>>((result, row) => {
+  return {
+    lands: (landRows as LandRow[]).map(toLand),
+    history: (transferRows as TransferRow[]).reduce<Record<number, TransferRecord[]>>((result, row) => {
       result[row.land_id] = [...(result[row.land_id] || []), toTransfer(row)];
       return result;
-    }, {});
+    }, {}),
+  };
+}
 
-    saveLocalRegistry(lands, history);
-    return { lands, history, isUsingFallback: false };
-  } catch (err) {
-    console.warn("Could not reach Supabase database (it may be inactive or paused). Using local demo storage instead.", err);
-    const local = loadLocalRegistry();
-    return { ...local, isUsingFallback: true };
+function loadRegistry(): Promise<RegistryData> {
+  if (!registryLoadInFlight) {
+    registryLoadInFlight = loadRegistryData().finally(() => {
+      registryLoadInFlight = null;
+    });
   }
+  return registryLoadInFlight;
+}
+
+function getLoadErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (
+    error !== null &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.length > 0
+  ) {
+    return error.message;
+  }
+  return "Unable to load land records";
 }
 
 export function useLandStore() {
@@ -256,24 +198,15 @@ export function useLandStore() {
   const [history, setHistory] = useState<Record<number, TransferRecord[]>>({});
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isUsingFallback, setIsUsingFallback] = useState(false);
-
-  const isFallbackRef = useRef(false);
-  isFallbackRef.current = isUsingFallback;
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const data = await loadRegistryData();
+      const data = await loadRegistry();
       setLands(data.lands);
       setHistory(data.history);
-      setIsUsingFallback(data.isUsingFallback);
-    } catch {
-      // Fallback guarantees data even if an unexpected exception occurs
-      const local = loadLocalRegistry();
-      setLands(local.lands);
-      setHistory(local.history);
-      setIsUsingFallback(true);
+    } catch (loadError) {
+      setError(getLoadErrorMessage(loadError));
     } finally {
       setLoaded(true);
     }
@@ -281,216 +214,108 @@ export function useLandStore() {
 
   useEffect(() => {
     void refresh();
+    const channel = supabase
+      .channel("land-registry-live")
+      .on("postgres_changes", { event: "*", schema: "public", table: "land_registry_lands" }, () => void refresh())
+      .on("postgres_changes", { event: "*", schema: "public", table: "land_registry_transfers" }, () => void refresh())
+      .subscribe();
 
-    if (!isSupabaseConfigured || !supabase) return;
-
-    const client = supabase;
-    try {
-      const channel = client
-        .channel("land-registry-live")
-        .on("postgres_changes", { event: "*", schema: "public", table: "land_registry_lands" }, () => void refresh())
-        .on("postgres_changes", { event: "*", schema: "public", table: "land_registry_transfers" }, () => void refresh())
-        .subscribe();
-
-      return () => {
-        void client.removeChannel(channel);
-      };
-    } catch {
-      // Ignore channel errors if remote is unreachable
-    }
+    return () => {
+      void supabase.removeChannel(channel);
+    };
   }, [refresh]);
 
-  const registerLand = useCallback(
-    async (land: Omit<Land, "id" | "registeredAt" | "isForSale">): Promise<Land> => {
-      const registeredAt = new Date().toISOString();
-      const registeredAtMs = new Date(registeredAt).getTime();
+  const registerLand = useCallback(async (land: Omit<Land, "id" | "registeredAt" | "isForSale">): Promise<Land> => {
+    const registeredAt = new Date().toISOString();
+    const { data, error: insertError } = await supabase
+      .from("land_registry_lands")
+      .insert({
+        location: land.location,
+        area_square_meters: land.areaSquareMeters,
+        survey_number: land.surveyNumber,
+        document_ipfs_hash: land.documentIpfsHash,
+        market_value: land.marketValue,
+        current_owner: land.currentOwner,
+        is_for_sale: false,
+        registered_at: registeredAt,
+        latitude: land.latitude,
+        longitude: land.longitude,
+      })
+      .select("*")
+      .maybeSingle();
 
-      if (!isFallbackRef.current && isSupabaseConfigured && supabase) {
-        try {
-          const { data, error: insertError } = await supabase
-            .from("land_registry_lands")
-            .insert({
-              location: land.location,
-              area_square_meters: land.areaSquareMeters,
-              survey_number: land.surveyNumber,
-              document_ipfs_hash: land.documentIpfsHash,
-              market_value: land.marketValue,
-              current_owner: land.currentOwner,
-              is_for_sale: false,
-              registered_at: registeredAt,
-              latitude: land.latitude,
-              longitude: land.longitude,
-            })
-            .select("*")
-            .maybeSingle();
+    if (insertError || !data) throw insertError ?? new Error("Land registration failed");
 
-          if (insertError || !data) throw insertError ?? new Error("Remote registration failed");
+    const newLand = toLand(data as LandRow);
+    const { error: historyError } = await supabase.from("land_registry_transfers").insert({
+      land_id: newLand.id,
+      from_owner: ZERO_ADDRESS,
+      to_owner: newLand.currentOwner,
+      transferred_at: registeredAt,
+      note: "Initial registration by Govt. Registrar",
+    });
 
-          const newLand = toLand(data as LandRow);
-          await supabase.from("land_registry_transfers").insert({
-            land_id: newLand.id,
-            from_owner: ZERO_ADDRESS,
-            to_owner: newLand.currentOwner,
-            transferred_at: registeredAt,
-            note: "Initial registration by Govt. Registrar",
-          });
+    if (historyError) throw historyError;
+    setLands((current) => [...current, newLand].sort((a, b) => a.id - b.id));
+    setHistory((current) => ({
+      ...current,
+      [newLand.id]: [
+        {
+          landId: newLand.id,
+          from: ZERO_ADDRESS,
+          to: newLand.currentOwner,
+          timestamp: newLand.registeredAt,
+          note: "Initial registration by Govt. Registrar",
+        },
+      ],
+    }));
+    return newLand;
+  }, []);
 
-          setLands((current) => [...current, newLand].sort((a, b) => a.id - b.id));
-          setHistory((current) => ({
-            ...current,
-            [newLand.id]: [
-              {
-                landId: newLand.id,
-                from: ZERO_ADDRESS,
-                to: newLand.currentOwner,
-                timestamp: newLand.registeredAt,
-                note: "Initial registration by Govt. Registrar",
-              },
-            ],
-          }));
-          return newLand;
-        } catch (err) {
-          console.warn("Supabase insert failed, persisting land locally instead:", err);
-          setIsUsingFallback(true);
-        }
-      }
+  const updateLandStatus = useCallback(async (id: number, isForSale: boolean) => {
+    const { data, error: updateError } = await supabase
+      .from("land_registry_lands")
+      .update({ is_for_sale: isForSale })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+    if (updateError || !data) throw updateError ?? new Error("Land status update failed");
+    const updatedLand = toLand(data as LandRow);
+    setLands((current) => current.map((land) => (land.id === id ? updatedLand : land)));
+  }, []);
 
-      // Local persistence fallback
-      const currentLands = lands.length > 0 ? lands : loadLocalRegistry().lands;
-      const nextId = currentLands.reduce((max, l) => Math.max(max, l.id), 0) + 1;
-      const newLand: Land = {
-        ...land,
-        id: nextId,
-        isForSale: false,
-        registeredAt: registeredAtMs,
-      };
+  const transferOwnership = useCallback(async (id: number, newOwner: string, note: string) => {
+    const currentLand = lands.find((land) => land.id === id);
+    if (!currentLand) throw new Error("Land record not found");
+    const transferredAt = new Date().toISOString();
+    const { data, error: updateError } = await supabase
+      .from("land_registry_lands")
+      .update({ current_owner: newOwner, is_for_sale: false })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+    if (updateError || !data) throw updateError ?? new Error("Ownership transfer failed");
 
-      const updatedLands = [...currentLands, newLand].sort((a, b) => a.id - b.id);
-      const newTransfer: TransferRecord = {
-        landId: newLand.id,
-        from: ZERO_ADDRESS,
-        to: newLand.currentOwner,
-        timestamp: registeredAtMs,
-        note: "Initial registration by Govt. Registrar",
-      };
+    const { error: historyError } = await supabase.from("land_registry_transfers").insert({
+      land_id: id,
+      from_owner: currentLand.currentOwner,
+      to_owner: newOwner,
+      transferred_at: transferredAt,
+      note,
+    });
+    if (historyError) throw historyError;
 
-      const updatedHistory = {
-        ...history,
-        [newLand.id]: [newTransfer],
-      };
-
-      setLands(updatedLands);
-      setHistory(updatedHistory);
-      saveLocalRegistry(updatedLands, updatedHistory);
-      return newLand;
-    },
-    [lands, history]
-  );
-
-  const updateLandStatus = useCallback(
-    async (id: number, isForSale: boolean) => {
-      if (!isFallbackRef.current && isSupabaseConfigured && supabase) {
-        try {
-          const { data, error: updateError } = await supabase
-            .from("land_registry_lands")
-            .update({ is_for_sale: isForSale })
-            .eq("id", id)
-            .select("*")
-            .maybeSingle();
-
-          if (updateError || !data) throw updateError ?? new Error("Remote update failed");
-          const updatedLand = toLand(data as LandRow);
-          setLands((current) => current.map((land) => (land.id === id ? updatedLand : land)));
-          return;
-        } catch (err) {
-          console.warn("Supabase update failed, updating land status locally:", err);
-          setIsUsingFallback(true);
-        }
-      }
-
-      // Local update fallback
-      setLands((current) => {
-        const next = current.map((land) => (land.id === id ? { ...land, isForSale } : land));
-        saveLocalRegistry(next, history);
-        return next;
-      });
-    },
-    [history]
-  );
-
-  const transferOwnership = useCallback(
-    async (id: number, newOwner: string, note: string) => {
-      const currentLand = lands.find((land) => land.id === id);
-      if (!currentLand) throw new Error("Land record not found");
-      const transferredAt = new Date().toISOString();
-      const transferredAtMs = new Date(transferredAt).getTime();
-
-      if (!isFallbackRef.current && isSupabaseConfigured && supabase) {
-        try {
-          const { data, error: updateError } = await supabase
-            .from("land_registry_lands")
-            .update({ current_owner: newOwner, is_for_sale: false })
-            .eq("id", id)
-            .select("*")
-            .maybeSingle();
-
-          if (updateError || !data) throw updateError ?? new Error("Remote transfer failed");
-
-          const { error: historyError } = await supabase.from("land_registry_transfers").insert({
-            land_id: id,
-            from_owner: currentLand.currentOwner,
-            to_owner: newOwner,
-            transferred_at: transferredAt,
-            note,
-          });
-
-          if (historyError) throw historyError;
-
-          const updatedLand = toLand(data as LandRow);
-          const record: TransferRecord = {
-            landId: id,
-            from: currentLand.currentOwner,
-            to: newOwner,
-            timestamp: transferredAtMs,
-            note,
-          };
-
-          setLands((current) => current.map((land) => (land.id === id ? updatedLand : land)));
-          setHistory((current) => ({ ...current, [id]: [...(current[id] || []), record] }));
-          return;
-        } catch (err) {
-          console.warn("Supabase transfer failed, applying transfer locally:", err);
-          setIsUsingFallback(true);
-        }
-      }
-
-      // Local transfer fallback
-      const updatedLand: Land = {
-        ...currentLand,
-        currentOwner: newOwner,
-        isForSale: false,
-      };
-
-      const record: TransferRecord = {
-        landId: id,
-        from: currentLand.currentOwner,
-        to: newOwner,
-        timestamp: transferredAtMs,
-        note,
-      };
-
-      const updatedLands = lands.map((land) => (land.id === id ? updatedLand : land));
-      const updatedHistory = {
-        ...history,
-        [id]: [...(history[id] || []), record],
-      };
-
-      setLands(updatedLands);
-      setHistory(updatedHistory);
-      saveLocalRegistry(updatedLands, updatedHistory);
-    },
-    [lands, history]
-  );
+    const updatedLand = toLand(data as LandRow);
+    const record: TransferRecord = {
+      landId: id,
+      from: currentLand.currentOwner,
+      to: newOwner,
+      timestamp: new Date(transferredAt).getTime(),
+      note,
+    };
+    setLands((current) => current.map((land) => (land.id === id ? updatedLand : land)));
+    setHistory((current) => ({ ...current, [id]: [...(current[id] || []), record] }));
+  }, [lands]);
 
   const getHistory = useCallback((id: number): TransferRecord[] => history[id] || [], [history]);
 
@@ -499,7 +324,6 @@ export function useLandStore() {
     history,
     loaded,
     error,
-    isUsingFallback,
     refresh,
     registerLand,
     updateLandStatus,
